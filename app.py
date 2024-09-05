@@ -10,7 +10,7 @@ import csv
 from pathlib import Path
 import tempfile
 
-st.set_page_config(page_title="Slackコミュニティ分析", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Slackコミュニティ分析", page_icon="😄", layout="wide")
 
 # Gemini APIの設定
 api_key = os.environ.get("API_KEY")
