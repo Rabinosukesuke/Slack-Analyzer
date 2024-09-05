@@ -1,0 +1,6 @@
+streamlit
+pandas
+plotly
+google-generativeai
+python-dateutil
+watchdog
