@@ -10,7 +10,7 @@ import csv
 from pathlib import Path
 import tempfile
 
-st.set_page_config(page_title="Slackコミュニティ分析", page_icon="😄", layout="wide")
+st.set_page_config(page_title="Slackコミュニティ分析", page_icon="📊", layout="wide")
 
 # Gemini APIの設定
 api_key = os.environ.get("API_KEY")
@@ -51,6 +51,19 @@ def load_users(users_file):
 def read_messages_from_json_file(file_path):
     with open(file_path, 'r') as f:
         return json.load(f)
+
+def format_tooltip(items):
+    if len(items) == 0:
+        return ""
+    elif len(items) == 1:
+        return items[0]
+    elif len(items) == 2:
+        return ", ".join(items)
+    else:
+        first = items[0]
+        last = items[-1]
+        middle = ", ".join(items[1:-1])
+        return f"{first}, <pre>{middle}</pre>, {last}"
 
 def update_stats(stats_by_channel, channel_name, messages, users):
     for message in messages:
@@ -133,48 +146,57 @@ def export_csv(stats_by_channel, output_file):
                         channel_name
                     ])
 
-# 全体統計の計算
 def calculate_overall_stats(df):
-    total_messages = len(df)
+    total_messages = df['posts'].sum()
     total_reactions = df['received_reactions'].sum()
-    active_users = df['display_name'].nunique()
-    total_channels = df['channel_name'].nunique()
+    
+    active_users = df.groupby('display_name').agg({
+        'posts': 'sum',
+        'given_reactions': 'sum'
+    }).reset_index()
+    active_users['total_activity'] = active_users['posts'] + active_users['given_reactions']
+    active_users = active_users[active_users['total_activity'] > 0]
+    
+    active_users_count = len(active_users)
+    active_users_list = active_users['display_name'].tolist()
+    
+    channels = df['channel_name'].unique()
+    total_channels = len(channels)
+    
     avg_messages_per_day = df.groupby('day')['posts'].sum().mean()
     avg_reactions_per_message = total_reactions / total_messages if total_messages > 0 else 0
     
     return {
         "総メッセージ数": total_messages,
         "総リアクション数": total_reactions,
-        "アクティブユーザー数": active_users,
+        "アクティブユーザー数": active_users_count,
+        "アクティブユーザーリスト": active_users_list,
+        "アクティブユーザー詳細": active_users,  
         "総チャンネル数": total_channels,
+        "チャンネル一覧": channels,
         "1日あたりの平均メッセージ数": avg_messages_per_day,
         "1メッセージあたりの平均リアクション数": avg_reactions_per_message
     }
 
-# チャンネル成長率の計算
 def calculate_channel_growth(df, start_date, end_date, previous_start_date):
     current_messages = df[(df['day'] >= start_date) & (df['day'] <= end_date)].groupby('channel_name')['posts'].sum()
     previous_messages = df[(df['day'] >= previous_start_date) & (df['day'] < start_date)].groupby('channel_name')['posts'].sum()
     growth = ((current_messages - previous_messages) / previous_messages).fillna(0).sort_values(ascending=False)
     return growth[growth > 0.1]  # 10%以上成長したチャンネルを表示
 
-# ユーザー成長率の計算
 def calculate_user_growth(df, start_date, end_date, previous_start_date):
     current_messages = df[(df['day'] >= start_date) & (df['day'] <= end_date)].groupby('display_name')['posts'].sum()
     previous_messages = df[(df['day'] >= previous_start_date) & (df['day'] < start_date)].groupby('display_name')['posts'].sum()
     
-    # previous_messages が 0 のユーザーを除外
     previous_messages = previous_messages[previous_messages != 0]
-
-    # 共通のユーザーのみを使用
     common_users = current_messages.index.intersection(previous_messages.index)
-
-    # 成長率を計算
-    growth = ((current_messages[common_users] - previous_messages[common_users]) / previous_messages[common_users]).fillna(0).sort_values(ascending=False)
+    growth = pd.Series(
+        ((current_messages[common_users] - previous_messages[common_users]) / previous_messages[common_users]).values,
+        index=common_users
+    )
     
     return growth[growth > 0.5]  # 50%以上成長したユーザーを表示
 
-# レポート生成関数
 def generate_report(df, start_date, end_date, previous_start_date):
     current_df = df[(df['day'] >= start_date) & (df['day'] <= end_date)]
     previous_df = df[(df['day'] >= previous_start_date) & (df['day'] < start_date)]
@@ -227,36 +249,29 @@ def generate_report(df, start_date, end_date, previous_start_date):
     except Exception as e:
         st.error(f"Gemini APIのエラー: {str(e)}")
         return None
-    
+
 def main():
     st.title('Slackコミュニティデータ分析')
     
     uploaded_file = st.file_uploader("Slackデータのzipファイルをアップロードしてください", type="zip")
     if uploaded_file is not None:
         with st.spinner("データを処理中..."):
-            # Create a temporary directory
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Save the uploaded file
                 zip_path = Path(tmpdir) / "slack_data.zip"
                 zip_path.write_bytes(uploaded_file.getvalue())
                 
-                # Unzip the file
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(tmpdir)
                 
-                # Process the data
                 stats_by_channel = process_slack_data(tmpdir)
                 
-                # Export to CSV
                 csv_path = Path(tmpdir) / "slack_data_analysis.csv"
                 export_csv(stats_by_channel, csv_path)
                 
-                # Load the CSV file
                 df = pd.read_csv(csv_path)
         
                 st.success("データの処理が完了しました！")
         
-        # 日付範囲の選択
         df['day'] = pd.to_datetime(df['day'])
         min_date = df['day'].min().date()
         max_date = df['day'].max().date()
@@ -264,7 +279,6 @@ def main():
         end_date = st.date_input("終了日", max_date, min_value=min_date, max_value=max_date)
 
         if start_date <= end_date:
-            # start_dateとend_dateをdatetime64[ns]型に変換
             start_datetime = pd.to_datetime(start_date)
             end_datetime = pd.to_datetime(end_date) + timedelta(days=1) - timedelta(microseconds=1)
             
@@ -276,28 +290,71 @@ def main():
             st.error("エラー: 終了日は開始日より後である必要があります。")
             return
 
-        # 全体統計
         st.header("全体統計")
+        
         current_stats = calculate_overall_stats(df_filtered)
         previous_df = df[(df['day'] >= previous_start_datetime) & (df['day'] < start_datetime)]
         previous_stats = calculate_overall_stats(previous_df)
-    
+        
         col1, col2, col3 = st.columns(3)
-        col1.metric("総メッセージ数", f"{current_stats['総メッセージ数']:,}", f"{current_stats['総メッセージ数'] - previous_stats['総メッセージ数']:,}")
-        col2.metric("総リアクション数", f"{current_stats['総リアクション数']:,}", f"{current_stats['総リアクション数'] - previous_stats['総リアクション数']:,}")
-        col3.metric("アクティブユーザー数", f"{current_stats['アクティブユーザー数']:,}", f"{current_stats['アクティブユーザー数'] - previous_stats['アクティブユーザー数']:,}")
+        col1.metric(
+            "総メッセージ数", 
+            f"{current_stats['総メッセージ数']:,}", 
+            f"{current_stats['総メッセージ数'] - previous_stats['総メッセージ数']:,}",
+            help="期間中に投稿された全てのメッセージの合計数です。"
+        )
+        col2.metric(
+            "総リアクション数", 
+            f"{current_stats['総リアクション数']:,}", 
+            f"{current_stats['総リアクション数'] - previous_stats['総リアクション数']:,}",
+            help="期間中に行われた全てのリアクションの合計数です。"
+        )
+
+        active_users_df = current_stats['アクティブユーザー詳細']
+        active_users_list = current_stats['アクティブユーザーリスト']
+        active_users_tooltip = format_tooltip(active_users_list)
+        col3.metric(
+            "アクティブユーザー数", 
+            f"{current_stats['アクティブユーザー数']:,}", 
+            f"{current_stats['アクティブユーザー数'] - previous_stats['アクティブユーザー数']:,}",
+            help="期間中に少なくとも1回以上の投稿またはリアクションを行ったユニークユーザーの数です。" + active_users_tooltip
+        )
 
         col4, col5, col6 = st.columns(3)
-        col4.metric("総チャンネル数", f"{current_stats['総チャンネル数']:,}", f"{current_stats['総チャンネル数'] - previous_stats['総チャンネル数']:,}")
-        col5.metric("1日あたりの平均メッセージ数", f"{current_stats['1日あたりの平均メッセージ数']:.2f}", f"{current_stats['1日あたりの平均メッセージ数'] - previous_stats['1日あたりの平均メッセージ数']:.2f}")
-        col6.metric("1メッセージあたりの平均リアクション数", f"{current_stats['1メッセージあたりの平均リアクション数']:.2f}", f"{current_stats['1メッセージあたりの平均リアクション数'] - previous_stats['1メッセージあたりの平均リアクション数']:.2f}")
+        channels_tooltip = format_tooltip(current_stats['チャンネル一覧'])
+        col4.metric(
+            "総チャンネル数", 
+            f"{current_stats['総チャンネル数']:,}", 
+            f"{current_stats['総チャンネル数'] - previous_stats['総チャンネル数']:,}",
+            help="アクティビティのあった全チャンネルの数です。" + channels_tooltip
+        )
+        col5.metric(
+            "1日あたりの平均メッセージ数", 
+            f"{current_stats['1日あたりの平均メッセージ数']:.2f}", 
+            f"{current_stats['1日あたりの平均メッセージ数'] - previous_stats['1日あたりの平均メッセージ数']:.2f}",
+            help="総メッセージ数を日数で割った値です。"
+        )
+        col6.metric(
+            "1メッセージあたりの平均リアクション数", 
+            f"{current_stats['1メッセージあたりの平均リアクション数']:.2f}", 
+            f"{current_stats['1メッセージあたりの平均リアクション数'] - previous_stats['1メッセージあたりの平均リアクション数']:.2f}",
+            help="総リアクション数を総メッセージ数で割った値です。"
+        )
 
-        # チャンネル分析
+        st.subheader("アクティブユーザー詳細")
+        st.info("このグラフは各ユーザーの活動状況を視覚化しています。X軸はメッセージ数、Y軸はリアクション数、円の大きさは総アクティビティ（メッセージ数 + リアクション数）を表しています。マウスオーバーでユーザー名と詳細な数値を確認できます。")
+        fig = px.scatter(active_users_df, x='posts', y='given_reactions', 
+                         size='total_activity', hover_name='display_name', 
+                         labels={'posts': 'メッセージ数', 'given_reactions': 'リアクション数'},
+                         title='ユーザーアクティビティ')
+        st.plotly_chart(fig, use_container_width=True)
+
         st.header("チャンネル分析")
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("トップ10チャンネル（メッセージ数）")
+            st.info("期間中にメッセージ数が最も多かった上位10チャンネルを表示しています。")
             top_channels = df_filtered.groupby('channel_name')['posts'].sum().sort_values(ascending=False).head(10)
             fig = px.bar(top_channels, x=top_channels.index, y=top_channels.values)
             fig.update_layout(xaxis_title="チャンネル名", yaxis_title="メッセージ数")
@@ -305,17 +362,20 @@ def main():
 
         with col2:
             st.subheader("チャンネル成長率")
+            st.info("チャンネルの成長率を表示しています。成長率 = (現在期間のメッセージ数 - 前期間のメッセージ数) / 前期間のメッセージ数。10%以上成長したチャンネルのみ表示しています。")
             channel_growth = calculate_channel_growth(df, start_datetime, end_datetime, previous_start_datetime)
-            fig = px.bar(channel_growth, x=channel_growth.index, y=channel_growth.values)
+            channel_growth_df = channel_growth.reset_index()
+            channel_growth_df.columns = ['channel_name', 'growth_rate']
+            fig = px.bar(channel_growth_df, x='channel_name', y='growth_rate')
             fig.update_layout(xaxis_title="チャンネル名", yaxis_title="成長率")
             st.plotly_chart(fig, use_container_width=True)
 
-        # ユーザーエンゲージメント分析
         st.header("ユーザーエンゲージメント分析")
         col1, col2 = st.columns(2)
 
         with col1:
             st.subheader("トップ10アクティブユーザー")
+            st.info("期間中に最も多くのメッセージを投稿した上位10ユーザーを表示しています。")
             top_users = df_filtered.groupby('display_name')['posts'].sum().sort_values(ascending=False).head(10)
             fig = px.bar(top_users, x=top_users.index, y='posts')
             fig.update_layout(xaxis_title="ユーザー名", yaxis_title="投稿数")
@@ -323,29 +383,31 @@ def main():
 
         with col2:
             st.subheader("ユーザー成長率")
+            st.info("ユーザーの成長率を表示しています。成長率 = (現在期間の投稿数 - 前期間の投稿数) / 前期間の投稿数。50%以上成長したユーザーのみ表示しています。前期間の投稿が0の場合は除外されます。")
             user_growth = calculate_user_growth(df, start_datetime, end_datetime, previous_start_datetime)
-            fig = px.bar(user_growth, x=user_growth.index, y=user_growth.values)
+            user_growth_df = user_growth.reset_index()
+            user_growth_df.columns = ['display_name', 'growth_rate']
+            fig = px.bar(user_growth_df, x='display_name', y='growth_rate')
             fig.update_layout(xaxis_title="ユーザー名", yaxis_title="成長率")
             st.plotly_chart(fig, use_container_width=True)
 
-        # 時系列分析
         st.header("時系列分析")
+        st.info("期間中のメッセージ数の推移を日単位で確認できます。週末や特定のイベント日などにどのような変化があるか観察できます。")
         activity_over_time = df_filtered.groupby('day')['posts'].sum().reset_index()
         fig = px.line(activity_over_time, x='day', y='posts')
         fig.update_layout(xaxis_title="日付", yaxis_title="メッセージ数")
         st.plotly_chart(fig, use_container_width=True)
 
-        # 曜日別・時間帯別分析
-        st.header("曜日別・時間帯別分析")
+        st.header("曜日別分析")
+        st.info("各曜日のメッセージ数を比較できます。平日と週末の違いや、特に活発な曜日を識別するのに役立ちます。")
         df_filtered['weekday'] = df_filtered['day'].dt.day_name()
         weekday_activity = df_filtered.groupby('weekday')['posts'].sum().reindex(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'])
         fig = px.bar(weekday_activity, x=weekday_activity.index, y=weekday_activity.values)
         fig.update_layout(xaxis_title="曜日", yaxis_title="メッセージ数")
         st.plotly_chart(fig, use_container_width=True)
 
-
-        # AIレポート生成
         st.header("AIによる総合分析レポート")
+        st.info("このセクションでは、Google の Gemini Pro AI モデルを使用して、上記のデータに基づいた総合的な分析レポートを生成します。レポートには、コミュニティの健全性、成長傾向、活動パターン、ユーザーエンゲージメントの特徴、そして改善のための提案が含まれます。")
         if st.button("レポートを生成"):
             with st.spinner("AIがレポートを生成中です..."):
                 report = generate_report(df, start_datetime, end_datetime, previous_start_datetime)
@@ -354,14 +416,13 @@ def main():
                 else:
                     st.error("レポートの生成に失敗しました。もう一度お試しください。")
                     
-        # Download processed data
-        csv = df.to_csv(index=False)
-        st.download_button(
-            label="処理済みデータをCSVでダウンロード",
-            data=csv,
-            file_name="slack_analysis_results.csv",
-            mime="text/csv",
-        )
+        # csv = df.to_csv(index=False)
+        # st.download_button(
+        #     label="処理済みデータをCSVでダウンロード",
+        #     data=csv,
+        #     file_name="slack_analysis_results.csv",
+        #     mime="text/csv",
+        # )
 
 if __name__ == "__main__":
     main()
